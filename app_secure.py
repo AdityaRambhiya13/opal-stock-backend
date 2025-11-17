@@ -1,7 +1,7 @@
 # app_secure.py
 import os
 import time
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 
 import yfinance as yf
 import pandas as pd
@@ -27,36 +27,63 @@ def get_api_key(api_key_header_value: Optional[str] = Security(api_key_header)) 
     return api_key_header_value
 
 # --- Cache: reduce repeated calls (per instance) ---
-# TTL in seconds (adjust as needed). Increase to e.g. 600 or 900 for heavier caching.
-cache = TTLCache(maxsize=2000, ttl=600)
+# MODIFIED: Increased TTL to 4 hours (14400s) to reduce rate-limiting
+cache = TTLCache(maxsize=2000, ttl=14400)
 
+# NEW FUNCTION: Replaces fetch_history_with_retries
 # Helper: robust yfinance fetch with retry/backoff
-def fetch_history_with_retries(ticker: str, period: str = "1y", interval: str = "1d", max_retries: int = 3, backoff_base: float = 1.0) -> pd.DataFrame:
+def fetch_yfinance_data(ticker: str, period: str = "1y", interval: str = "1d", max_retries: int = 3, backoff_base: float = 1.0) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """
+    Fetches both history and info for a ticker with retry logic.
+    """
     last_exception = None
     for attempt in range(1, max_retries + 1):
         try:
             tk = yf.Ticker(ticker)
+            
+            # 1. Fetch History
             hist = tk.history(period=period, interval=interval, auto_adjust=False)
             if hist is None or hist.empty:
                 raise ValueError("No history returned for ticker")
             hist = hist[['Open', 'High', 'Low', 'Close', 'Volume']]
             hist.index = pd.to_datetime(hist.index)
-            return hist
+            
+            # 2. Fetch Info (inside the same try block)
+            info = tk.info
+            if not info or info.get('quoteType') == "MUTUALFUND" and info.get('marketCap') is None:
+                 if "no data found" in str(info).lower():
+                     raise ValueError(f"No data found for ticker {ticker}")
+                 if not info.get('marketCap') and not info.get('longName'):
+                     raise ValueError(f"Incomplete info data returned for {ticker}")
+
+            # 3. Success: return both
+            return hist, info
+        
         except Exception as e:
             last_exception = e
-            # inspect common indicators of rate-limiting
             txt = str(e).lower()
-            if "too many requests" in txt or "429" in txt or "rate limit" in txt:
-                # exponential backoff
+            
+            # Check for rate limit or transient errors
+            if ("too many requests" in txt or "429" in txt or "rate limit" in txt or 
+                "failed to read" in txt or "connect error" in txt):
+                
+                # Exponential backoff
                 time.sleep(backoff_base * (2 ** (attempt - 1)))
                 continue
-            # transient network errors: backoff and retry
-            time.sleep(backoff_base * (2 ** (attempt - 1)))
-    # after retries, raise more informative error
-    msg = f"Data fetch error: {str(last_exception)}"
-    # if rate-limited, return a 429
+            
+            # Check for "Not Found" errors
+            if "no data found" in txt or "404" in txt:
+                raise HTTPException(status_code=404, detail=f"Ticker '{ticker}' not found or no data available.")
+            
+            # Other non-retryable error
+            break
+
+    # After all retries, raise the appropriate error
+    msg = f"Data fetch error for {ticker}: {str(last_exception)}"
     if last_exception and ("too many" in str(last_exception).lower() or "429" in str(last_exception)):
         raise HTTPException(status_code=429, detail="Data fetch error: Too Many Requests. Rate limited. Try after a while.")
+    
+    # Catch-all for other persistent fetch failures
     raise HTTPException(status_code=502, detail=msg)
 
 
@@ -96,15 +123,21 @@ def compute_technical_indicators(df: pd.DataFrame) -> Dict[str, Any]:
 
 @cached(cache)
 def prepare_payload(ticker: str) -> Dict[str, Any]:
-    hist = fetch_history_with_retries(ticker, period="1y", interval="1d", max_retries=3)
+    # MODIFIED: Call the new function to get both hist and info at once
+    hist, info = fetch_yfinance_data(ticker, period="1y", interval="1d", max_retries=3)
+    
     last_close = float(hist['Close'].iloc[-1])
     prev_close = float(hist['Close'].iloc[-2]) if len(hist) >= 2 else last_close
     tech = compute_technical_indicators(hist)
-    info = yf.Ticker(ticker).info
+    
+    # REMOVED: This line is no longer needed as info is fetched above
+    # info = yf.Ticker(ticker).info 
+    
     pe = info.get('trailingPE') or info.get('forwardPE')
     eps = info.get('trailingEps') or info.get('epsTrailingTwelveMonths')
     market_cap = info.get('marketCap')
     pct_1d = ((last_close - prev_close) / prev_close) * 100 if prev_close else 0.0
+    
     payload = {
         "ticker": ticker,
         "name": info.get('longName') or info.get('shortName'),
