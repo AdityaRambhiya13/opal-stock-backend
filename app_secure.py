@@ -1,68 +1,70 @@
 import os
 import yfinance as yf
-import ta as ta
+import pandas as pd
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.security.api_key import APIKeyHeader
-from fastapi.openapi.models import APIKey, APIKeyIn, SecurityScheme
-from fastapi.security import APIKeyHeader
-from fastapi.middleware.cors import CORSMiddleware
-
-# ----------------------------------------------------------------------------
-# SECURITY SCHEME (makes Authorize button appear in Swagger UI)
-# ----------------------------------------------------------------------------
-api_key_scheme = APIKeyHeader(name="x-api-key", auto_error=False)
+from ta.momentum import RSIIndicator
+from ta.trend import MACD
 
 app = FastAPI()
 
-# Enable CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-PRIVATE_API_KEY = os.getenv("PRIVATE_API_KEY")
+# Load API key from environment variable
+API_KEY = os.getenv("PRIVATE_API_KEY")
 
 def verify_api_key(request: Request):
-    api_key = request.headers.get("x-api-key")
-    if api_key != PRIVATE_API_KEY:
+    """Check API key"""
+    client_key = request.headers.get("x-api-key")
+    if not client_key or client_key != API_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized: Invalid or missing API key.")
-    return True
+
+@app.get("/")
+def root():
+    return {"message": "Backend is running!"}
 
 @app.get("/opal_payload")
-def opal_payload(request: Request, ticker: str, shares: float, cost: float):
-
+def stock_analysis(ticker: str, shares: float, cost: float, request: Request):
+    """Main stock analysis endpoint"""
     verify_api_key(request)
 
-    data = yf.Ticker(ticker).history(period="1y")
+    data = yf.download(ticker, period="1y", progress=False)
     if data.empty:
         raise HTTPException(status_code=404, detail="Ticker not found")
 
-    data["rsi_14"] = ta.rsi(data["Close"], length=14)
-    macd = ta.macd(data["Close"])
-    data["sma_50"] = ta.sma(data["Close"], length=50)
-    data["sma_200"] = ta.sma(data["Close"], length=200)
+    close = data["Close"]
 
-    current_price = float(data["Close"].iloc[-1])
-    investment_value = shares * current_price
+    # RSI
+    rsi = RSIIndicator(close=close, window=14).rsi().iloc[-1]
+
+    # MACD
+    macd_ind = MACD(close=close)
+    macd_val = macd_ind.macd().iloc[-1]
+    signal_val = macd_ind.macd_signal().iloc[-1]
+    hist_val = macd_ind.macd_diff().iloc[-1]
+
+    # SMA
+    sma_50 = close.rolling(50).mean().iloc[-1]
+    sma_200 = close.rolling(200).mean().iloc[-1]
+
+    # Latest price
+    last_price = float(close.iloc[-1])
+    investment_value = shares * last_price
     pnl = investment_value - (shares * cost)
 
     return {
-        "ticker": ticker,
+        "ticker": ticker.upper(),
         "shares": shares,
         "buy_cost": cost,
-        "current_price": current_price,
+        "current_price": last_price,
         "investment_value": investment_value,
         "pnl": pnl,
         "technicals": {
-            "rsi_14": float(data["rsi_14"].iloc[-1]),
+            "rsi_14": float(rsi),
             "macd": {
-                "macd": float(macd["MACD_12_26_9"].iloc[-1]),
-                "signal": float(macd["MACDs_12_26_9"].iloc[-1]),
-                "hist": float(macd["MACDh_12_26_9"].iloc[-1]),
+                "macd": float(macd_val),
+                "signal": float(signal_val),
+                "hist": float(hist_val)
             },
-            "sma_50": float(data["sma_50"].iloc[-1]),
-            "sma_200": float(data["sma_200"].iloc[-1]),
+            "sma_50": float(sma_50),
+            "sma_200": float(sma_200)
         }
     }
+
