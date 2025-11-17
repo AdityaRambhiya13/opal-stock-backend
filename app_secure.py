@@ -1,6 +1,6 @@
 import os
 import yfinance as yf
-import pandas_ta as ta
+import ta as ta
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.security.api_key import APIKeyHeader
 from fastapi.openapi.models import APIKey, APIKeyIn, SecurityScheme
