@@ -1,70 +1,131 @@
+# app_secure.py
 import os
+from typing import Optional, Dict, Any
+
 import yfinance as yf
 import pandas as pd
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, HTTPException, Security, Depends
+from fastapi.security.api_key import APIKeyHeader
+from fastapi.responses import JSONResponse
+
 from ta.momentum import RSIIndicator
-from ta.trend import MACD
+from ta.trend import MACD, SMAIndicator
 
-app = FastAPI()
+# ----------------
+# CONFIG
+# ----------------
+API_KEY_NAME = "x-api-key"
+PRIVATE_API_KEY = os.getenv("PRIVATE_API_KEY", None)
 
-# Load API key from environment variable
-API_KEY = os.getenv("PRIVATE_API_KEY")
+# Security dependency (adds OpenAPI security scheme -> "Authorize" button)
+api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
 
-def verify_api_key(request: Request):
-    """Check API key"""
-    client_key = request.headers.get("x-api-key")
-    if not client_key or client_key != API_KEY:
-        raise HTTPException(status_code=401, detail="Unauthorized: Invalid or missing API key.")
+async def get_api_key(api_key_header_value: Optional[str] = Security(api_key_header)):
+    if PRIVATE_API_KEY is None:
+        # If env var not set, treat as unauthorized (safer)
+        raise HTTPException(status_code=401, detail="Server misconfiguration: PRIVATE_API_KEY not set.")
+    if api_key_header_value == PRIVATE_API_KEY:
+        return api_key_header_value
+    raise HTTPException(status_code=401, detail="Unauthorized: Invalid or missing API key.")
 
-@app.get("/")
-def root():
-    return {"message": "Backend is running!"}
+app = FastAPI(
+    title="Private Stock Fetcher for Opal",
+    description="Returns live price, PnL and technical indicators for any ticker supported by yfinance.",
+)
 
-@app.get("/opal_payload")
-def stock_analysis(ticker: str, shares: float, cost: float, request: Request):
-    """Main stock analysis endpoint"""
-    verify_api_key(request)
+# ---------------------------
+# Technical indicators helper
+# ---------------------------
+def compute_technical_indicators(df: pd.DataFrame) -> Dict[str, Any]:
+    close = df["Close"]
 
-    data = yf.download(ticker, period="1y", progress=False)
-    if data.empty:
-        raise HTTPException(status_code=404, detail="Ticker not found")
+    # RSI 14
+    try:
+        rsi14 = RSIIndicator(close, window=14).rsi().iloc[-1]
+    except Exception:
+        rsi14 = None
 
-    close = data["Close"]
+    # MACD (12,26,9)
+    try:
+        macd_ind = MACD(close, window_slow=26, window_fast=12, window_sign=9)
+        macd = {
+            "macd": macd_ind.macd().iloc[-1],
+            "signal": macd_ind.macd_signal().iloc[-1],
+            "hist": macd_ind.macd_diff().iloc[-1]
+        }
+    except Exception:
+        macd = {"macd": None, "signal": None, "hist": None}
 
-    # RSI
-    rsi = RSIIndicator(close=close, window=14).rsi().iloc[-1]
-
-    # MACD
-    macd_ind = MACD(close=close)
-    macd_val = macd_ind.macd().iloc[-1]
-    signal_val = macd_ind.macd_signal().iloc[-1]
-    hist_val = macd_ind.macd_diff().iloc[-1]
-
-    # SMA
-    sma_50 = close.rolling(50).mean().iloc[-1]
-    sma_200 = close.rolling(200).mean().iloc[-1]
-
-    # Latest price
-    last_price = float(close.iloc[-1])
-    investment_value = shares * last_price
-    pnl = investment_value - (shares * cost)
+    # SMA 50 / 200
+    try:
+        sma50 = SMAIndicator(close, window=50).sma_indicator().iloc[-1]
+    except Exception:
+        sma50 = None
+    try:
+        sma200 = SMAIndicator(close, window=200).sma_indicator().iloc[-1]
+    except Exception:
+        sma200 = None
 
     return {
-        "ticker": ticker.upper(),
-        "shares": shares,
-        "buy_cost": cost,
-        "current_price": last_price,
-        "investment_value": investment_value,
-        "pnl": pnl,
-        "technicals": {
-            "rsi_14": float(rsi),
-            "macd": {
-                "macd": float(macd_val),
-                "signal": float(signal_val),
-                "hist": float(hist_val)
-            },
-            "sma_50": float(sma_50),
-            "sma_200": float(sma_200)
-        }
+        "rsi_14": None if pd.isna(rsi14) else float(rsi14),
+        "macd": {
+            "macd": None if pd.isna(macd["macd"]) else float(macd["macd"]),
+            "signal": None if pd.isna(macd["signal"]) else float(macd["signal"]),
+            "hist": None if pd.isna(macd["hist"]) else float(macd["hist"]),
+        },
+        "sma_50": None if sma50 is None or pd.isna(sma50) else float(sma50),
+        "sma_200": None if sma200 is None or pd.isna(sma200) else float(sma200)
     }
 
+# ---------------------------
+# Endpoint (protected)
+# ---------------------------
+@app.get("/opal_payload", summary="Get Opal-ready stock payload", tags=["opal"])
+async def opal_payload(ticker: str, shares: float = 0.0, cost: float = 0.0, api_key: str = Depends(get_api_key)):
+    """
+    Returns live price, PnL and technical indicators for the requested ticker.
+    Protected by x-api-key header (use the Authorize button in /docs to set it).
+    """
+    ticker = ticker.strip()
+    if not ticker:
+        raise HTTPException(status_code=400, detail="Missing ticker parameter.")
+
+    # fetch 1y daily history
+    try:
+        tk = yf.Ticker(ticker)
+        hist = tk.history(period="1y", interval="1d", auto_adjust=False)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Data fetch error: {e}")
+
+    if hist is None or hist.empty:
+        raise HTTPException(status_code=404, detail="Invalid ticker or no data found.")
+
+    hist = hist[['Open', 'High', 'Low', 'Close', 'Volume']]
+    hist.index = pd.to_datetime(hist.index)
+
+    tech = compute_technical_indicators(hist)
+    last_close = float(hist['Close'].iloc[-1])
+    prev_close = float(hist['Close'].iloc[-2]) if len(hist) >= 2 else last_close
+    investment_value = shares * last_close
+    pnl = (last_close - cost) * shares
+
+    info = {}
+    try:
+        info = tk.info
+    except Exception:
+        info = {}
+
+    response = {
+        "ticker": ticker,
+        "name": info.get("longName") or info.get("shortName"),
+        "shares": float(shares),
+        "buy_cost": float(cost),
+        "current_price": float(last_close),
+        "prev_close": float(prev_close),
+        "investment_value": float(investment_value),
+        "pnl": float(pnl),
+        "technicals": tech,
+        "ohlc_last_5": hist.tail(5).reset_index().to_dict(orient="records")
+    }
+
+    return JSONResponse({"status": "ok", "data": response})
