@@ -1,89 +1,68 @@
 import os
 import yfinance as yf
-import pandas as pd
+import pandas_ta as ta
 from fastapi import FastAPI, Request, HTTPException
-from ta.momentum import RSIIndicator
-from ta.trend import MACD, SMAIndicator
+from fastapi.security.api_key import APIKeyHeader
+from fastapi.openapi.models import APIKey, APIKeyIn, SecurityScheme
+from fastapi.security import APIKeyHeader
+from fastapi.middleware.cors import CORSMiddleware
+
+# ----------------------------------------------------------------------------
+# SECURITY SCHEME (makes Authorize button appear in Swagger UI)
+# ----------------------------------------------------------------------------
+api_key_scheme = APIKeyHeader(name="x-api-key", auto_error=False)
 
 app = FastAPI()
 
-# ---------------------------
-# TECHNICAL INDICATOR LOGIC
-# ---------------------------
-def compute_technical_indicators(df):
-    close = df["Close"]
+# Enable CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-    # RSI 14
-    try:
-        rsi14 = RSIIndicator(close, window=14).rsi().iloc[-1]
-    except:
-        rsi14 = None
+PRIVATE_API_KEY = os.getenv("PRIVATE_API_KEY")
 
-    # MACD (12, 26, 9)
-    try:
-        macd_ind = MACD(close, window_slow=26, window_fast=12, window_sign=9)
-        macd = {
-            "macd": macd_ind.macd().iloc[-1],
-            "signal": macd_ind.macd_signal().iloc[-1],
-            "hist": macd_ind.macd_diff().iloc[-1]
-        }
-    except:
-        macd = {"macd": None, "signal": None, "hist": None}
-
-    # SMA 50
-    try:
-        sma50 = SMAIndicator(close, window=50).sma_indicator().iloc[-1]
-    except:
-        sma50 = None
-
-    # SMA 200
-    try:
-        sma200 = SMAIndicator(close, window=200).sma_indicator().iloc[-1]
-    except:
-        sma200 = None
-
-    return {
-        "rsi_14": None if pd.isna(rsi14) else float(rsi14),
-        "macd": {
-            "macd": None if pd.isna(macd["macd"]) else float(macd["macd"]),
-            "signal": None if pd.isna(macd["signal"]) else float(macd["signal"]),
-            "hist": None if pd.isna(macd["hist"]) else float(macd["hist"]),
-        },
-        "sma_50": None if sma50 is None or pd.isna(sma50) else float(sma50),
-        "sma_200": None if sma200 is None or pd.isna(sma200) else float(sma200)
-    }
-
-
-# ---------------------------
-# API ENDPOINT
-# ---------------------------
-@app.get("/opal_payload")
-async def generate_payload(request: Request, ticker: str, shares: float, cost: float):
-    # API key validation
-    private_key = os.getenv("PRIVATE_API_KEY")
-    incoming_key = request.headers.get("x-api-key")
-
-    if not private_key or incoming_key != private_key:
+def verify_api_key(request: Request):
+    api_key = request.headers.get("x-api-key")
+    if api_key != PRIVATE_API_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized: Invalid or missing API key.")
+    return True
 
-    # Download stock data
-    stock = yf.Ticker(ticker)
-    hist = stock.history(period="1y")
+@app.get("/opal_payload")
+def opal_payload(request: Request, ticker: str, shares: float, cost: float):
 
-    if hist.empty:
-        raise HTTPException(status_code=404, detail="Invalid ticker or no data found.")
+    verify_api_key(request)
 
-    tech = compute_technical_indicators(hist)
-    current_price = hist["Close"].iloc[-1]
+    data = yf.Ticker(ticker).history(period="1y")
+    if data.empty:
+        raise HTTPException(status_code=404, detail="Ticker not found")
+
+    data["rsi_14"] = ta.rsi(data["Close"], length=14)
+    macd = ta.macd(data["Close"])
+    data["sma_50"] = ta.sma(data["Close"], length=50)
+    data["sma_200"] = ta.sma(data["Close"], length=200)
+
+    current_price = float(data["Close"].iloc[-1])
     investment_value = shares * current_price
-    pnl = (current_price - cost) * shares
+    pnl = investment_value - (shares * cost)
 
     return {
         "ticker": ticker,
         "shares": shares,
         "buy_cost": cost,
-        "current_price": float(current_price),
-        "investment_value": float(investment_value),
-        "pnl": float(pnl),
-        "technicals": tech
+        "current_price": current_price,
+        "investment_value": investment_value,
+        "pnl": pnl,
+        "technicals": {
+            "rsi_14": float(data["rsi_14"].iloc[-1]),
+            "macd": {
+                "macd": float(macd["MACD_12_26_9"].iloc[-1]),
+                "signal": float(macd["MACDs_12_26_9"].iloc[-1]),
+                "hist": float(macd["MACDh_12_26_9"].iloc[-1]),
+            },
+            "sma_50": float(data["sma_50"].iloc[-1]),
+            "sma_200": float(data["sma_200"].iloc[-1]),
+        }
     }
